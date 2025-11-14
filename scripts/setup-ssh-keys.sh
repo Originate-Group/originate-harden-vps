@@ -55,6 +55,11 @@ create_admin_user() {
     # Add to sudo group
     usermod -aG sudo "$ADMIN_USER"
 
+    # Set password for admin user
+    log_info "Setting password for $ADMIN_USER..."
+    echo "Please set a secure password for the admin user:"
+    passwd "$ADMIN_USER"
+
     # Configure sudo WITH password for admin user (more secure)
     log_info "Sudo access configured for $ADMIN_USER (requires password)"
 }
