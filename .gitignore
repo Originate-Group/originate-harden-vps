@@ -11,6 +11,9 @@ id_rsa*
 id_ed25519*
 authorized_keys
 
+# Claude Code settings (user-specific allow/deny decisions)
+.claude/settings.local.json
+
 # Backup files
 *.bak
 *.backup

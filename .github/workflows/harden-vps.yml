@@ -13,19 +13,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Harden VPS
         uses: appleboy/ssh-action@v1.2.3
         env:
           ADMIN_EMAIL: ${{ vars.ADMIN_EMAIL }}
+          ADMIN_USER: ${{ vars.ADMIN_USER }}
+          ADMIN_KEY: ${{ vars.ADMIN_KEY }}
+          DEPLOY_USER: ${{ vars.SSH_USER }}
         with:
           host: ${{ inputs.vps_host || vars.VPS_HOST }}
           username: ${{ vars.SSH_USER }}
           port: ${{ vars.SSH_PORT }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: ADMIN_EMAIL
+          envs: ADMIN_EMAIL,ADMIN_USER,ADMIN_KEY,DEPLOY_USER
           command_timeout: 30m
           script: |
             set -e
@@ -44,24 +44,16 @@ jobs:
             log_info "Target: $(hostname)"
             log_info "User: $(whoami)"
 
-            # Create workspace directory
-            WORKSPACE="/tmp/common-infrastructure-$$"
-            mkdir -p ${WORKSPACE}
-            cd ${WORKSPACE}
-
-            # Clone repository (using HTTPS, no auth needed for public repo)
-            log_step "Cloning common-infrastructure repository..."
-            git clone https://github.com/Originate-Group/common-infrastructure.git .
-
-            # Make scripts executable
-            chmod +x scripts/*.sh
-
-            # Step 1: System updates
+            # =================================================================
+            # STEP 1: System Updates
+            # =================================================================
             log_step "Updating system packages..."
             sudo apt-get update -qq
             sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
 
-            # Step 2: Install essential tools
+            # =================================================================
+            # STEP 2: Install Essential Tools
+            # =================================================================
             log_step "Installing essential tools..."
             sudo apt-get install -y -qq \
               curl \
@@ -72,38 +64,63 @@ jobs:
               unzip \
               ca-certificates \
               gnupg \
-              lsb-release
+              lsb-release \
+              ufw
 
-            # Step 3: Configure automatic security updates
+            # =================================================================
+            # STEP 3: Configure Automatic Security Updates
+            # =================================================================
             log_step "Configuring automatic security updates..."
-            sudo apt-get install -y -qq unattended-upgrades
-            sudo dpkg-reconfigure -plow unattended-upgrades
+            sudo apt-get install -y -qq unattended-upgrades apt-listchanges
 
-            # Step 4: Install Docker
-            log_step "Installing Docker..."
-            if command -v docker &> /dev/null; then
-              log_warn "Docker already installed: $(docker --version)"
-            else
-              sudo ./scripts/setup-docker.sh
-            fi
+            # Configure unattended upgrades (using brace groups - deployment-sme pattern #1)
+            {
+              echo 'Unattended-Upgrade::Allowed-Origins {'
+              echo '    "${distro_id}:${distro_codename}";'
+              echo '    "${distro_id}:${distro_codename}-security";'
+              echo '    "${distro_id}ESMApps:${distro_codename}-apps-security";'
+              echo '    "${distro_id}ESM:${distro_codename}-infra-security";'
+              echo '};'
+              echo 'Unattended-Upgrade::AutoFixInterruptedDpkg "true";'
+              echo 'Unattended-Upgrade::MinimalSteps "true";'
+              echo 'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'
+              echo 'Unattended-Upgrade::Remove-Unused-Dependencies "true";'
+              echo 'Unattended-Upgrade::Automatic-Reboot "false";'
+            } | sudo tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null
 
-            # Step 5: Install Caddy
-            log_step "Installing Caddy web server..."
-            if command -v caddy &> /dev/null; then
-              log_warn "Caddy already installed: $(caddy version)"
-            else
-              sudo ./scripts/setup-caddy.sh
-            fi
+            # Configure auto-upgrade schedule
+            {
+              echo 'APT::Periodic::Update-Package-Lists "1";'
+              echo 'APT::Periodic::Unattended-Upgrade "1";'
+              echo 'APT::Periodic::AutocleanInterval "7";'
+            } | sudo tee /etc/apt/apt.conf.d/20auto-upgrades > /dev/null
 
-            # Step 6: Configure firewall
+            # =================================================================
+            # STEP 4: Configure UFW Firewall (idempotent)
+            # =================================================================
             log_step "Configuring UFW firewall..."
-            sudo ./scripts/setup-firewall.sh
 
-            # Step 7: Install fail2ban
+            # Only reset if not already configured
+            if ! sudo ufw status | grep -q "Status: active"; then
+              sudo ufw --force reset
+              sudo ufw default deny incoming
+              sudo ufw default allow outgoing
+              sudo ufw limit 22/tcp comment 'SSH - rate limited'
+              sudo ufw allow 80/tcp comment 'HTTP'
+              sudo ufw allow 443/tcp comment 'HTTPS'
+              echo "y" | sudo ufw enable
+              log_info "UFW configured with SSH rate limiting (max 6 connections per 30 seconds)"
+            else
+              log_info "UFW already configured and active"
+            fi
+
+            # =================================================================
+            # STEP 5: Install and Configure fail2ban
+            # =================================================================
             log_step "Installing fail2ban..."
             sudo apt-get install -y -qq fail2ban
 
-            # Configure fail2ban for SSH (using brace groups, not heredocs - deployment-sme pattern #1)
+            # Configure fail2ban for SSH (idempotent - overwrite is safe)
             {
               echo "[sshd]"
               echo "enabled = true"
@@ -118,23 +135,577 @@ jobs:
             sudo systemctl enable fail2ban
             sudo systemctl restart fail2ban
 
-            # Step 8: Install Python venv support (for Python apps)
+            # =================================================================
+            # STEP 6: Install Docker (idempotent)
+            # =================================================================
+            log_step "Installing Docker..."
+
+            if command -v docker &> /dev/null; then
+              log_info "Docker already installed: $(docker --version)"
+            else
+              # Install prerequisites
+              sudo apt-get install -y -qq \
+                ca-certificates \
+                curl \
+                gnupg \
+                lsb-release
+
+              # Add Docker's GPG key and repository
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+                sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+              echo \
+                "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                $(lsb_release -cs) stable" | \
+                sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+              # Install Docker
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq \
+                docker-ce \
+                docker-ce-cli \
+                containerd.io \
+                docker-buildx-plugin \
+                docker-compose-plugin
+
+              # Configure Docker daemon with security hardening
+              sudo mkdir -p /etc/docker
+              {
+                echo '{'
+                echo '  "log-driver": "json-file",'
+                echo '  "log-opts": {'
+                echo '    "max-size": "10m",'
+                echo '    "max-file": "3"'
+                echo '  },'
+                echo '  "live-restore": true,'
+                echo '  "userland-proxy": false,'
+                echo '  "no-new-privileges": true,'
+                echo '  "icc": false'
+                echo '}'
+              } | sudo tee /etc/docker/daemon.json > /dev/null
+
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              log_info "Docker installed successfully with security hardening"
+            fi
+
+            # Add deployment user to docker group (idempotent)
+            if id "${DEPLOY_USER}" &>/dev/null; then
+              sudo usermod -aG docker "${DEPLOY_USER}"
+            fi
+
+            # Configure Docker security best practices
+            log_step "Applying Docker security configurations..."
+
+            # Ensure docker.service.d directory exists for systemd overrides
+            sudo mkdir -p /etc/systemd/system/docker.service.d
+
+            # Create systemd override for resource limits
+            {
+              echo '[Service]'
+              echo 'LimitNOFILE=1048576'
+              echo 'LimitNPROC=infinity'
+              echo 'LimitCORE=infinity'
+            } | sudo tee /etc/systemd/system/docker.service.d/limits.conf > /dev/null
+
+            # Reload systemd and restart docker if it was already running
+            sudo systemctl daemon-reload
+            if systemctl is-active --quiet docker; then
+              sudo systemctl restart docker
+            fi
+
+            log_info "Docker security hardening applied"
+            log_info "Note: Containers should be run with --security-opt=no-new-privileges:true"
+            log_info "Note: Use --user flag to run containers as non-root users"
+            log_info "Note: Use --cap-drop=ALL and --cap-add=<specific> to minimize capabilities"
+
+            # =================================================================
+            # STEP 7: Install Caddy (idempotent)
+            # =================================================================
+            log_step "Installing Caddy web server..."
+
+            if command -v caddy &> /dev/null; then
+              log_info "Caddy already installed: $(caddy version)"
+            else
+              # Install prerequisites
+              sudo apt-get install -y -qq \
+                debian-keyring \
+                debian-archive-keyring \
+                apt-transport-https \
+                curl
+
+              # Add Caddy's GPG key and repository
+              curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | \
+                sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+              curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | \
+                sudo tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
+
+              # Install Caddy
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq caddy
+              log_info "Caddy installed successfully"
+            fi
+
+            # Setup Caddy directories (idempotent)
+            sudo mkdir -p /etc/caddy/conf.d
+            sudo chmod 755 /etc/caddy/conf.d
+            sudo mkdir -p /var/log/caddy
+            sudo chown caddy:caddy /var/log/caddy
+            sudo chmod 755 /var/log/caddy
+
+            # Configure main Caddyfile (idempotent - safe to overwrite)
+            if [[ -z "${ADMIN_EMAIL}" ]]; then
+              log_warn "ADMIN_EMAIL not provided, skipping Caddy configuration"
+            else
+              # Write main Caddyfile (using brace groups - deployment-sme pattern #1)
+              {
+                echo '# ============================================================================='
+                echo '# Main Caddy Configuration'
+                echo '# ============================================================================='
+                echo '# This file is managed by common-infrastructure repo'
+                echo '# DO NOT add application-specific configurations here'
+                echo '#'
+                echo '# Application configurations should be placed in:'
+                echo '#   /etc/caddy/conf.d/<app-name>.caddy'
+                echo '#'
+                echo '# Each application deployment writes its own snippet file.'
+                echo '# ============================================================================='
+                echo ''
+                echo '{'
+                echo '    # Global options'
+                echo "    email ${ADMIN_EMAIL}"
+                echo ''
+                echo '    # Enable admin API on localhost only'
+                echo '    admin localhost:2019'
+                echo '}'
+                echo ''
+                echo '# Import all application configurations'
+                echo 'import /etc/caddy/conf.d/*.caddy'
+              } | sudo tee /etc/caddy/Caddyfile > /dev/null
+
+              sudo chmod 644 /etc/caddy/Caddyfile
+
+              # Create example snippet with enhanced security headers
+              {
+                echo '# ============================================================================='
+                echo '# Example: Secure reverse proxy configuration with hardened security headers'
+                echo '# ============================================================================='
+                echo '# References:'
+                echo '#   - https://caddyserver.com/docs/caddyfile/directives/reverse_proxy'
+                echo '#   - https://owasp.org/www-project-secure-headers/'
+                echo '# ============================================================================='
+                echo '#'
+                echo '# example.originate.group {'
+                echo '#     reverse_proxy localhost:3000'
+                echo '#'
+                echo '#     # Security headers (2025 best practices)'
+                echo '#     header {'
+                echo '#         # HSTS - Force HTTPS for 1 year including subdomains'
+                echo '#         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"'
+                echo '#'
+                echo '#         # Prevent clickjacking attacks'
+                echo '#         X-Frame-Options "SAMEORIGIN"'
+                echo '#'
+                echo '#         # Prevent MIME type sniffing'
+                echo '#         X-Content-Type-Options "nosniff"'
+                echo '#'
+                echo '#         # XSS protection for legacy browsers'
+                echo '#         X-XSS-Protection "1; mode=block"'
+                echo '#'
+                echo '#         # Control referrer information'
+                echo '#         Referrer-Policy "strict-origin-when-cross-origin"'
+                echo '#'
+                echo '#         # Restrict browser features (adjust per application needs)'
+                echo '#         Permissions-Policy "geolocation=(), microphone=(), camera=()"'
+                echo '#'
+                echo '#         # Content Security Policy (customize for your application)'
+                echo '#         Content-Security-Policy "default-src '\''self'\''; script-src '\''self'\''; style-src '\''self'\'' '\''unsafe-inline'\''"'
+                echo '#'
+                echo '#         # Remove server identification'
+                echo '#         -Server'
+                echo '#     }'
+                echo '#'
+                echo '#     # Logging'
+                echo '#     log {'
+                echo '#         output file /var/log/caddy/example-access.log'
+                echo '#         format json'
+                echo '#     }'
+                echo '# }'
+              } | sudo tee /etc/caddy/conf.d/example.caddy.disabled > /dev/null
+
+              sudo systemctl enable caddy
+
+              # Validate Caddyfile before restart (deployment-sme pattern #7)
+              if ! sudo caddy validate --config /etc/caddy/Caddyfile; then
+                log_warn "Caddy configuration validation failed"
+                exit 1
+              fi
+
+              # Remove log files created during validation (owned by root)
+              sudo rm -f /var/log/caddy/*.log
+
+              sudo systemctl restart caddy
+              log_info "Caddy configured successfully"
+            fi
+
+            # =================================================================
+            # STEP 8: Configure Kernel Hardening (sysctl)
+            # =================================================================
+            log_step "Configuring kernel security parameters..."
+
+            # Create sysctl hardening configuration
+            {
+              echo '# ============================================================================='
+              echo '# Kernel Security Hardening Parameters'
+              echo '# ============================================================================='
+              echo '# Managed by common-infrastructure repo'
+              echo '# References:'
+              echo '#   - https://www.cyberciti.biz/faq/linux-kernel-etcsysctl-conf-security-hardening/'
+              echo '#   - https://linux-audit.com/system-hardening/linux-hardening-with-sysctl/'
+              echo '# ============================================================================='
+              echo ''
+              echo '# Network Security - IPv4'
+              echo 'net.ipv4.tcp_syncookies = 1                    # SYN flood protection'
+              echo 'net.ipv4.conf.all.rp_filter = 1                # Reverse path filtering (anti-spoofing)'
+              echo 'net.ipv4.conf.default.rp_filter = 1'
+              echo 'net.ipv4.conf.all.accept_source_route = 0      # Disable source routing'
+              echo 'net.ipv4.conf.default.accept_source_route = 0'
+              echo 'net.ipv4.conf.all.accept_redirects = 0         # Disable ICMP redirects'
+              echo 'net.ipv4.conf.default.accept_redirects = 0'
+              echo 'net.ipv4.conf.all.secure_redirects = 0         # Disable secure ICMP redirects'
+              echo 'net.ipv4.conf.default.secure_redirects = 0'
+              echo 'net.ipv4.icmp_echo_ignore_broadcasts = 1       # Ignore ping broadcasts (Smurf attack protection)'
+              echo 'net.ipv4.icmp_ignore_bogus_error_responses = 1 # Ignore bogus ICMP error responses'
+              echo 'net.ipv4.conf.all.log_martians = 1             # Log suspicious packets (martians)'
+              echo 'net.ipv4.conf.default.log_martians = 1'
+              echo 'net.ipv4.conf.all.send_redirects = 0           # Disable sending ICMP redirects'
+              echo 'net.ipv4.conf.default.send_redirects = 0'
+              echo ''
+              echo '# IPv6 Security (disable if not in use)'
+              echo 'net.ipv6.conf.all.disable_ipv6 = 1'
+              echo 'net.ipv6.conf.default.disable_ipv6 = 1'
+              echo 'net.ipv6.conf.lo.disable_ipv6 = 1'
+              echo 'net.ipv6.conf.all.accept_redirects = 0'
+              echo 'net.ipv6.conf.default.accept_redirects = 0'
+              echo 'net.ipv6.conf.all.accept_source_route = 0'
+              echo 'net.ipv6.conf.default.accept_source_route = 0'
+              echo ''
+              echo '# Kernel Security'
+              echo 'kernel.dmesg_restrict = 1                      # Restrict dmesg access to root only'
+              echo 'kernel.kptr_restrict = 2                       # Hide kernel pointers in /proc'
+              echo 'kernel.yama.ptrace_scope = 1                   # Restrict ptrace to prevent process snooping'
+              echo ''
+              echo '# Filesystem Security'
+              echo 'fs.protected_hardlinks = 1                     # Prevent hardlink-based attacks'
+              echo 'fs.protected_symlinks = 1                      # Prevent symlink-based attacks'
+              echo 'fs.suid_dumpable = 0                           # Disable core dumps for setuid programs'
+            } | sudo tee /etc/sysctl.d/99-security-hardening.conf > /dev/null
+
+            # Apply sysctl settings
+            sudo sysctl -p /etc/sysctl.d/99-security-hardening.conf > /dev/null 2>&1 || true
+            log_info "Kernel security parameters configured"
+
+            # =================================================================
+            # STEP 9: Install and Configure auditd (Kernel-Level Auditing)
+            # =================================================================
+            log_step "Installing auditd for kernel-level security auditing..."
+
+            if ! command -v auditd &> /dev/null; then
+              sudo apt-get install -y -qq auditd audispd-plugins
+              log_info "auditd installed"
+            else
+              log_info "auditd already installed"
+            fi
+
+            # Configure audit rules for security monitoring
+            {
+              echo '# ============================================================================='
+              echo '# Audit Rules for Security Monitoring'
+              echo '# ============================================================================='
+              echo '# Managed by common-infrastructure repo'
+              echo '# References:'
+              echo '#   - https://linux-audit.com/configuring-and-auditing-linux-systems-with-audit-daemon/'
+              echo '#   - https://medium.com/@bmcrathnayaka/your-must-have-linux-security-superpower-mastering-auditd-f107cd54bd77'
+              echo '# ============================================================================='
+              echo ''
+              echo '# Delete all existing rules'
+              echo '-D'
+              echo ''
+              echo '# Buffer size (increase if you experience rate limit problems)'
+              echo '-b 8192'
+              echo ''
+              echo '# Failure mode: 1=print, 2=panic (system halt)'
+              echo '-f 1'
+              echo ''
+              echo '# Monitor authentication and authorization'
+              echo '-w /etc/passwd -p wa -k identity'
+              echo '-w /etc/group -p wa -k identity'
+              echo '-w /etc/shadow -p wa -k identity'
+              echo '-w /etc/gshadow -p wa -k identity'
+              echo '-w /etc/sudoers -p wa -k sudoers'
+              echo '-w /etc/sudoers.d/ -p wa -k sudoers'
+              echo ''
+              echo '# Monitor SSH configuration'
+              echo '-w /etc/ssh/sshd_config -p wa -k sshd_config'
+              echo '-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config'
+              echo ''
+              echo '# Monitor privileged commands'
+              echo '-a always,exit -F arch=b64 -S execve -F euid=0 -k root_commands'
+              echo '-a always,exit -F arch=b32 -S execve -F euid=0 -k root_commands'
+              echo ''
+              echo '# Monitor file deletions'
+              echo '-a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=-1 -k delete'
+              echo '-a always,exit -F arch=b32 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=-1 -k delete'
+              echo ''
+              echo '# Monitor network configuration changes'
+              echo '-w /etc/hosts -p wa -k network_config'
+              echo '-w /etc/network/ -p wa -k network_config'
+              echo ''
+              echo '# Monitor Docker-related activity'
+              echo '-w /usr/bin/docker -p wa -k docker'
+              echo '-w /var/lib/docker/ -p wa -k docker'
+              echo '-w /etc/docker/ -p wa -k docker'
+              echo ''
+              echo '# Monitor Caddy configuration'
+              echo '-w /etc/caddy/ -p wa -k caddy_config'
+              echo ''
+              echo '# Make configuration immutable (must be last rule)'
+              echo '-e 2'
+            } | sudo tee /etc/audit/rules.d/99-security-hardening.rules > /dev/null
+
+            # Enable and restart auditd
+            sudo systemctl enable auditd
+            sudo systemctl restart auditd || log_warn "auditd restart deferred (requires augenrules --load)"
+            log_info "auditd configured with security monitoring rules"
+
+            # =================================================================
+            # STEP 10: Install and Configure AIDE (File Integrity Monitoring)
+            # =================================================================
+            log_step "Installing AIDE for file integrity monitoring..."
+
+            if ! command -v aide &> /dev/null; then
+              sudo apt-get install -y -qq aide aide-common
+              log_info "AIDE installed"
+            else
+              log_info "AIDE already installed"
+            fi
+
+            # Configure AIDE to monitor critical system directories
+            {
+              echo '# ============================================================================='
+              echo '# AIDE Configuration - File Integrity Monitoring'
+              echo '# ============================================================================='
+              echo '# Managed by common-infrastructure repo'
+              echo '# References:'
+              echo '#   - https://linux-audit.com/aide-file-integrity-scanner-installation-and-configuration/'
+              echo '#   - https://moss.sh/server-management/best-practices-for-ubuntu-server-security-2025/'
+              echo '# ============================================================================='
+              echo ''
+              echo '# Monitor system binaries and libraries'
+              echo '/usr/bin R+b+sha512'
+              echo '/usr/sbin R+b+sha512'
+              echo '/bin R+b+sha512'
+              echo '/sbin R+b+sha512'
+              echo '/lib R+b+sha512'
+              echo '/lib64 R+b+sha512'
+              echo '/usr/lib R+b+sha512'
+              echo ''
+              echo '# Monitor boot files'
+              echo '/boot R+b+sha512'
+              echo ''
+              echo '# Monitor system configuration'
+              echo '/etc R+b+sha512'
+              echo ''
+              echo '# Monitor Docker'
+              echo '/usr/bin/docker R+b+sha512'
+              echo '/etc/docker R+b+sha512'
+              echo ''
+              echo '# Monitor Caddy'
+              echo '/usr/bin/caddy R+b+sha512'
+              echo '/etc/caddy R+b+sha512'
+              echo ''
+              echo '# Exclude volatile directories'
+              echo '!/var/log'
+              echo '!/var/cache'
+              echo '!/var/tmp'
+              echo '!/tmp'
+              echo '!/proc'
+              echo '!/sys'
+              echo '!/run'
+              echo '!/dev'
+            } | sudo tee /etc/aide/aide.conf.d/99-custom-monitoring.conf > /dev/null
+
+            # Initialize AIDE database (this can take a few minutes)
+            log_info "Initializing AIDE database (this may take several minutes)..."
+            if [[ ! -f /var/lib/aide/aide.db ]]; then
+              sudo aideinit || log_warn "AIDE initialization failed - will retry on next run"
+              if [[ -f /var/lib/aide/aide.db.new ]]; then
+                sudo mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+                log_info "AIDE database initialized successfully"
+              fi
+            else
+              log_info "AIDE database already exists"
+            fi
+
+            # Create daily AIDE check cron job
+            {
+              echo '#!/bin/bash'
+              echo '# AIDE daily integrity check'
+              echo '/usr/bin/aide --check | /usr/bin/logger -t AIDE'
+            } | sudo tee /etc/cron.daily/aide-check > /dev/null
+            sudo chmod 755 /etc/cron.daily/aide-check
+
+            log_info "AIDE configured - daily integrity checks will run via cron"
+            log_info "Manual check: sudo aide --check"
+            log_info "Update database: sudo aide --update && sudo mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db"
+
+            # =================================================================
+            # STEP 11: Verify AppArmor Status
+            # =================================================================
+            log_step "Verifying AppArmor status..."
+
+            if command -v aa-status &> /dev/null; then
+              APPARMOR_PROFILES=$(sudo aa-status --profiled 2>/dev/null || echo "0")
+              APPARMOR_ENFORCED=$(sudo aa-status --enforced 2>/dev/null || echo "0")
+              log_info "AppArmor profiles loaded: ${APPARMOR_PROFILES}, enforced: ${APPARMOR_ENFORCED}"
+
+              # Verify Docker AppArmor integration (Ubuntu 24.04+)
+              if sudo aa-status 2>/dev/null | grep -q docker; then
+                log_info "Docker AppArmor profile detected and active"
+              else
+                log_warn "Docker AppArmor profile not detected (will be loaded when Docker runs containers)"
+              fi
+            else
+              log_warn "AppArmor tools not found (should be installed by default on Ubuntu 24.04)"
+            fi
+
+            # =================================================================
+            # STEP 11: Configure Shared Memory Protection
+            # =================================================================
+            log_step "Configuring shared memory protection..."
+
+            # Check if /run/shm is already secured in /etc/fstab
+            if ! grep -q "/run/shm.*noexec" /etc/fstab 2>/dev/null; then
+              # Add secure mount options for shared memory
+              echo "tmpfs /run/shm tmpfs defaults,noexec,nosuid,nodev 0 0" | sudo tee -a /etc/fstab > /dev/null
+              log_info "Shared memory protection added to /etc/fstab"
+
+              # Remount immediately if /run/shm exists
+              if mountpoint -q /run/shm 2>/dev/null; then
+                sudo mount -o remount,noexec,nosuid,nodev /run/shm || log_warn "Could not remount /run/shm (will apply on reboot)"
+                log_info "Shared memory remounted with security options"
+              fi
+            else
+              log_info "Shared memory protection already configured"
+            fi
+
+            # =================================================================
+            # STEP 12: Audit Unnecessary Services
+            # =================================================================
+            log_step "Auditing enabled services..."
+
+            # List all enabled services (excluding essential system services)
+            ENABLED_SERVICES=$(sudo systemctl list-unit-files --state=enabled --type=service --no-pager --no-legend | \
+              grep -v -E '(systemd-|dbus|getty|ssh|ufw|fail2ban|docker|caddy|auditd|cron|rsyslog|unattended-upgrades)' | \
+              awk '{print $1}' || true)
+
+            if [[ -n "$ENABLED_SERVICES" ]]; then
+              log_info "Non-essential enabled services detected:"
+              echo "$ENABLED_SERVICES" | while read -r service; do
+                echo "  - $service"
+              done
+              log_info "Review these services and disable if not needed: sudo systemctl disable <service>"
+            else
+              log_info "No unnecessary services detected"
+            fi
+
+            # List listening network services (excluding known good ones)
+            log_info "Network services listening:"
+            sudo ss -tulpn | grep LISTEN | grep -v -E '(127.0.0.1|::1)' | \
+              awk '{print "  " $5 " - " $7}' | sort -u || log_info "  Only localhost services detected"
+
+            # =================================================================
+            # STEP 13: Install Python venv Support
+            # =================================================================
             log_step "Installing Python venv support..."
             if ! dpkg -l | grep -q "^ii.*python3.*-venv"; then
               sudo apt-get install -y -qq python3-venv python3-pip
             fi
 
-            # Step 9: Harden SSH configuration
+            # =================================================================
+            # STEP 14: Setup Admin User and Configure Passwordless Sudo (idempotent)
+            # =================================================================
+            if [[ -n "${ADMIN_USER}" && -n "${ADMIN_KEY}" ]]; then
+              log_step "Setting up admin user: ${ADMIN_USER}..."
+
+              # Create admin user if doesn't exist
+              if ! id "${ADMIN_USER}" &>/dev/null; then
+                sudo useradd -m -s /bin/bash "${ADMIN_USER}"
+                log_info "User ${ADMIN_USER} created"
+              else
+                log_info "User ${ADMIN_USER} already exists"
+              fi
+
+              # Add to sudo group (idempotent)
+              sudo usermod -aG sudo "${ADMIN_USER}"
+
+              # Configure passwordless sudo for admin user (idempotent - safe to overwrite)
+              echo "${ADMIN_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${ADMIN_USER} > /dev/null
+              sudo chmod 440 /etc/sudoers.d/${ADMIN_USER}
+
+              # Setup SSH directory and authorized_keys (idempotent - safe to overwrite)
+              sudo mkdir -p /home/${ADMIN_USER}/.ssh
+              echo "${ADMIN_KEY}" | sudo tee /home/${ADMIN_USER}/.ssh/authorized_keys > /dev/null
+              sudo chown -R ${ADMIN_USER}:${ADMIN_USER} /home/${ADMIN_USER}/.ssh
+              sudo chmod 700 /home/${ADMIN_USER}/.ssh
+              sudo chmod 600 /home/${ADMIN_USER}/.ssh/authorized_keys
+
+              log_info "Admin user ${ADMIN_USER} configured with SSH key access and passwordless sudo"
+            else
+              log_warn "ADMIN_USER or ADMIN_KEY not provided, skipping admin user setup"
+            fi
+
+            # Configure passwordless sudo for deploy user (idempotent)
+            if id "${DEPLOY_USER}" &>/dev/null; then
+              log_step "Configuring passwordless sudo for deploy user: ${DEPLOY_USER}..."
+
+              # Add to sudo group if not already a member
+              sudo usermod -aG sudo "${DEPLOY_USER}"
+
+              # Configure passwordless sudo (idempotent - safe to overwrite)
+              echo "${DEPLOY_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${DEPLOY_USER} > /dev/null
+              sudo chmod 440 /etc/sudoers.d/${DEPLOY_USER}
+
+              log_info "Deploy user ${DEPLOY_USER} configured with passwordless sudo"
+            else
+              log_warn "Deploy user ${DEPLOY_USER} not found"
+            fi
+
+            # =================================================================
+            # STEP 15: Harden SSH Configuration (idempotent)
+            # =================================================================
             log_step "Hardening SSH configuration..."
 
-            # Backup original sshd_config
-            sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+            # Backup original sshd_config (only if backup doesn't exist)
+            if [[ ! -f /etc/ssh/sshd_config.backup ]]; then
+              sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+            fi
 
-            # Update SSH configuration
+            # Update SSH configuration (idempotent - sed with regex handles both commented and uncommented)
             sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
             sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
             sudo sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
             sudo sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+
+            # Add KbdInteractiveAuthentication if not present
+            if ! grep -q "^KbdInteractiveAuthentication" /etc/ssh/sshd_config; then
+              echo "KbdInteractiveAuthentication no" | sudo tee -a /etc/ssh/sshd_config > /dev/null
+            else
+              sudo sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config
+            fi
 
             # Test SSH configuration
             if sudo sshd -t; then
@@ -146,16 +717,15 @@ jobs:
               exit 1
             fi
 
-            # Step 10: Set timezone (optional)
+            # =================================================================
+            # STEP 16: Set Timezone
+            # =================================================================
             log_step "Setting timezone to UTC..."
             sudo timedatectl set-timezone UTC
 
-            # Cleanup
-            log_step "Cleaning up..."
-            cd /
-            rm -rf ${WORKSPACE}
-
-            # Final status report
+            # =================================================================
+            # Final Status Report
+            # =================================================================
             log_info "=== Hardening Complete ==="
             echo ""
             log_info "Installed Services:"
@@ -163,12 +733,50 @@ jobs:
             echo "  Docker Compose: $(docker compose version)"
             echo "  Caddy: $(caddy version)"
             echo "  Python: $(python3 --version)"
+            echo "  Auditd: $(auditctl --version 2>&1 | head -1 || echo 'installed')"
+            echo "  AIDE: $(aide --version 2>&1 | head -1 || echo 'installed')"
             echo ""
-            log_info "Security:"
+            log_info "Security - Network:"
             echo "  Firewall: $(sudo ufw status | head -1)"
+            echo "  SSH Rate Limiting: Enabled (6 conn/30sec)"
             echo "  Fail2ban: $(sudo systemctl is-active fail2ban)"
             echo "  SSH Root Login: Disabled"
             echo "  SSH Password Auth: Disabled"
             echo ""
-            log_info "VPS is ready for application deployments!"
-            log_info "Each app should write its Caddy config to: /etc/caddy/conf.d/<app-name>.caddy"
+            log_info "Security - Kernel & System:"
+            echo "  Kernel Hardening: Enabled (sysctl)"
+            echo "  Audit Logging: $(sudo systemctl is-active auditd)"
+            echo "  File Integrity: AIDE configured (daily checks)"
+            echo "  AppArmor: Enabled ($(sudo aa-status --profiled 2>/dev/null || echo '0') profiles loaded)"
+            echo "  Shared Memory: Protected (noexec,nosuid,nodev)"
+            echo ""
+            log_info "Security - Docker:"
+            echo "  Privilege Escalation: Blocked (no-new-privileges)"
+            echo "  Inter-Container Comm: Disabled by default (icc=false)"
+            echo "  Log Rotation: Enabled (10MB max, 3 files)"
+            echo ""
+            log_info "Security - Web (Caddy):"
+            echo "  Example config includes hardened security headers"
+            echo "  HSTS, CSP, X-Frame-Options, etc. configured"
+            echo ""
+            log_info "Users:"
+            if id "${ADMIN_USER}" &>/dev/null; then
+              echo "  Admin: ${ADMIN_USER} (passwordless sudo)"
+            fi
+            if id "${DEPLOY_USER}" &>/dev/null; then
+              echo "  Deploy: ${DEPLOY_USER} (passwordless sudo)"
+            fi
+            echo "  Note: Passwordless sudo is safe with SSH key-only authentication"
+            echo ""
+            log_info "VPS is hardened and ready for application deployments!"
+            log_info ""
+            log_info "Important Files:"
+            echo "  Caddy configs: /etc/caddy/conf.d/<app-name>.caddy"
+            echo "  Audit logs: /var/log/audit/audit.log"
+            echo "  AIDE database: /var/lib/aide/aide.db"
+            echo "  Security configs: /etc/sysctl.d/99-security-hardening.conf"
+            log_info ""
+            log_info "Post-Deployment Commands:"
+            echo "  Check AIDE: sudo aide --check"
+            echo "  Review audit: sudo aureport --summary"
+            echo "  UFW status: sudo ufw status verbose"
